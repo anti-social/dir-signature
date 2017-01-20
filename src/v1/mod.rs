@@ -5,10 +5,12 @@ mod writer;
 mod progress;
 mod hash;
 mod scan;
+mod reader;
 
 use std::io;
 
 pub use error::Error;
+pub use self::reader::{Entry, Reader};
 
 use self::progress::Progress;
 use self::writer::SyncWriter;
