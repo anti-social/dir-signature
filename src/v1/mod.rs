@@ -10,7 +10,7 @@ mod reader;
 use std::io;
 
 pub use error::Error;
-pub use self::reader::{Entry, Reader};
+pub use self::reader::{Entry, Parser, ParseError};
 
 use self::progress::Progress;
 use self::writer::SyncWriter;
