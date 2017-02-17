@@ -33,6 +33,7 @@ extern crate typenum;
 extern crate itertools;
 #[macro_use] extern crate log;
 #[macro_use] extern crate quick_error;
+#[macro_use] extern crate matches;
 
 pub mod v1;
 mod error;
