@@ -18,10 +18,12 @@ DIRSIGNATURE.v1 sha512/256 block_size=32768
 ";
     let reader = BufReader::new(Cursor::new(&content[..]));
     let mut signature_parser = Parser::new(reader).unwrap();
+
     let header = signature_parser.get_header();
     assert_eq!(header.get_version(), "v1");
     assert_eq!(header.get_hash_type(), HashType::Sha512_256);
     assert_eq!(header.get_block_size(), 32768);
+
     let entry = signature_parser.next().unwrap().unwrap();
     match entry {
         Entry::Dir(dir) => {
@@ -31,31 +33,35 @@ DIRSIGNATURE.v1 sha512/256 block_size=32768
             panic!("Expected directory");
         }
     }
+
     let entry = signature_parser.next().unwrap().unwrap();
     match entry {
         Entry::File(path, size, mut hashes) => {
             assert_eq!(path, Path::new("/empty.txt"));
             assert_eq!(size, 0);
-            assert!(hashes.next().is_none());
+            assert!(hashes.iter().next().is_none());
         },
         _ => {
             panic!("Expected file")
         }
     }
+
     let entry = signature_parser.next().unwrap().unwrap();
     match entry {
         Entry::File(path, size, mut hashes) => {
+            let mut hashes_iter = hashes.iter();
             assert_eq!(path, Path::new("/hello.txt"));
             assert_eq!(size, 6);
-            assert_eq!(hashes.next().unwrap(), "8dd499a36d950b8732f85a3bffbc8d8bee4a0af391e8ee2bb0aa0c4553b6c0fc");
-            assert!(hashes.next().is_none());
+            assert_eq!(hashes_iter.next().unwrap(),
+                "8dd499a36d950b8732f85a3bffbc8d8bee4a0af391e8ee2bb0aa0c4553b6c0fc");
+            assert!(hashes_iter.next().is_none());
         },
         _ => {
             panic!("Expected file")
         }
     }
-    assert_eq!(signature_parser.advance("/subdir/link").unwrap(), ());
-    let entry = signature_parser.next().unwrap().unwrap();
+
+    let entry = signature_parser.advance("/subdir/link").unwrap().unwrap();
     match entry {
         Entry::Link(path, dest) => {
             assert_eq!(path, Path::new("/subdir/link"));
@@ -65,6 +71,9 @@ DIRSIGNATURE.v1 sha512/256 block_size=32768
             panic!("Expected symlink")
         }
     }
+
+    assert!(signature_parser.advance("/subdir/link").unwrap().is_none());
+    assert!(signature_parser.next().is_none());
 }
 
 #[test]

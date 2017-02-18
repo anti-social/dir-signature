@@ -1,4 +1,7 @@
+use std;
 use std::borrow::Cow;
+use std::cmp::Ordering;
+use std::convert::From;
 use std::error::Error;
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -6,7 +9,8 @@ use std::fmt;
 use std::io;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
-use std::str::from_utf8;
+use std::slice::Iter;
+use std::str::{FromStr, Utf8Error};
 
 use quick_error::ResultExt;
 
@@ -38,6 +42,12 @@ impl Error for ParseRowError {
     }
 }
 
+impl From<Utf8Error> for ParseRowError {
+    fn from(err: Utf8Error) -> ParseRowError {
+        ParseRowError(format!("expected valid utf8 string: {}", err))
+    }
+}
+
 quick_error! {
     #[derive(Debug)]
     pub enum ParseError {
@@ -56,55 +66,22 @@ quick_error! {
     }
 }
 
-/// Entry hashes iterator
-pub struct Hashes(String);
-
-impl Iterator for Hashes {
-    type Item = Cow<'static, str>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        None
-    }
-}
-
-/// Represents an entry from dir signature file
-pub enum Entry {
-    /// Direcory
-    Dir(PathBuf),
-    /// File
-    File(PathBuf, usize, Hashes),
-    /// Link
-    Link(PathBuf, PathBuf),
-}
-
-impl Entry {
-    pub fn parse(row: &[u8]) -> Result<Entry, ParseRowError> {
-        if row.starts_with(b"/") {
-            return Ok(Entry::Dir(parse_path_buf(row)));
-        }
-        // } else if row.starts_with("  ") {
-        //     let row = &row[2..];
-        //     let (path, row) = parse_str(row)?;
-        // }
-        Err(ParseRowError(format!("Expected \"/\" or \"  \" (two whitespaces)")))
-    }
-}
-
 /// Represents header of the dir signature file
 #[derive(Clone)]
 pub struct Header {
     version: String,
     hash_type: HashType,
-    block_size: u32,
+    block_size: u64,
 }
 
 impl Header {
-    pub fn parse(line: &[u8]) -> Result<Header, ParseRowError> {
-        let mut parts = line.split(|c| *c == b' ');
+    pub fn parse(row: &[u8]) -> Result<Header, ParseRowError> {
+        let line = std::str::from_utf8(row)?.trim_right_matches('\n');
+        let mut parts = line.split(' ');
         let version = if let Some(signature) = parts.next() {
-            let mut sig_parts = signature.splitn(2, |c| *c == b'.');
+            let mut sig_parts = signature.splitn(2, '.');
             if let Some(magic) = sig_parts.next() {
-                if magic != MAGIC.as_bytes() {
+                if magic != MAGIC {
                     return Err(ParseRowError(
                         format!("Invalid signature: expected {:?} but was {:?}",
                             MAGIC, magic)));
@@ -118,11 +95,36 @@ impl Header {
         } else {
             return Err(ParseRowError("Invalid header".to_string()));
         };
+        let hash_type = if let Some(hash_type_str) = parts.next() {
+            HashType::from_str(hash_type_str)
+                .map_err(|e| ParseRowError(format!("{}", e)))?
+        } else {
+            return Err(ParseRowError(
+                "Invalid header: missing hash type".to_string()));
+        };
+        let block_size = if let Some(block_size_attr) = parts.next() {
+            let mut block_size_kv = block_size_attr.splitn(2, '=');
+            match block_size_kv.next() {
+                None => return Err(ParseRowError(
+                    format!("Invalid header: missing block_size"))),
+                Some(k) if k != "block_size" => return Err(ParseRowError(
+                    format!("Invalid header: expected block_size attribute"))),
+                Some(_) => {
+                    let v = block_size_kv.next().unwrap();
+                    println!("block_size: {:?}", v);
+                    u64::from_str_radix(v, 10)
+                        .map_err(|e| ParseRowError(format!("Invalid header: {}", e)))?
+                },
+            }
+        } else {
+            return Err(ParseRowError(
+                format!("Invalid header: missing block size attribute")));
+        };
         // TODO: parse other fields
         Ok(Header {
-            version: from_utf8(version).unwrap().to_string(),
-            hash_type: HashType::Sha512_256,
-            block_size: 32768,
+            version: version.to_string(),
+            hash_type: hash_type,
+            block_size: block_size,
         })
     }
 
@@ -134,8 +136,91 @@ impl Header {
         self.hash_type
     }
 
-    pub fn get_block_size(&self) -> u32 {
+    pub fn get_block_size(&self) -> u64 {
         self.block_size
+    }
+}
+
+/// Entry hashes iterator
+#[derive(Debug)]
+pub struct Hashes(Vec<String>);
+
+impl Hashes {
+    pub fn parse(row: &[u8]) -> Result<Hashes, ParseRowError> {
+        let hashes_str = std::str::from_utf8(row)?.to_string();
+        if hashes_str.is_empty() {
+            Ok(Hashes(vec!()))
+        } else {
+            Ok(Hashes(hashes_str.split(' ')
+                .map(|h| h.to_string())
+                .collect::<Vec<_>>()))
+
+        }
+    }
+
+    pub fn iter(&self) -> Iter<String> {
+        self.0.iter()
+    }
+}
+
+// struct HashesIterator {
+//     hashes: String,
+//     cur_pos: 0,
+// }
+
+// impl Iterator for HashesIterator {
+//     type Item = Cow<'static, str>;
+
+//     fn next(&mut self) -> Option<Self::Item> {
+//         self.cur_pos
+//     }
+// }
+
+/// Represents an entry from dir signature file
+#[derive(Debug)]
+pub enum Entry {
+    /// Direcory
+    Dir(PathBuf),
+    /// File
+    File(PathBuf, u64, Hashes),
+    // File(PathBuf, bool, usize, Hashes),
+    /// Link
+    Link(PathBuf, PathBuf),
+}
+
+impl Entry {
+    pub fn parse(row: &[u8], cur_dir: &Path) -> Result<Entry, ParseRowError> {
+        let row = if row.ends_with(b"\n") {
+            &row[..row.len()-1]
+        } else {
+            row
+        };
+        println!("row: {}", String::from_utf8_lossy(row));
+        let entry = if row.starts_with(b"/") {
+            let (path, row) = parse_path_buf(row);
+            Entry::Dir(path)
+        } else if row.starts_with(b"  ") {
+            let row = &row[2..];
+            let (path, row) = parse_path_buf(row); // TODO: optimize
+            let path = cur_dir.join(&path);
+            let (file_type, row) = parse_os_str(row);
+            if file_type == "f" || file_type == "x" {
+                let (size, row) = parse_u64(row)?;
+                let hashes = Hashes::parse(row)?;
+                Entry::File(path, size, hashes)
+            } else if file_type == "s" {
+                let (dest, row) = parse_path_buf(row);
+                Entry::Link(path, dest)
+            } else {
+                return Err(ParseRowError(
+                    format!("Unknown file type: {:?}",
+                        String::from_utf8_lossy(file_type.as_bytes()))))
+            }
+        } else {
+            return Err(ParseRowError(
+                format!("Expected \"/\" or \"  \" (two whitespaces)")));
+        };
+        Ok(entry)
     }
 }
 
@@ -143,6 +228,7 @@ impl Header {
 pub struct Parser<R: BufRead> {
     header: Header,
     reader: R,
+    current_dir: PathBuf,
     current_row_num: usize,
 }
 
@@ -153,7 +239,8 @@ impl<R: BufRead> Parser<R> {
         Ok(Parser {
             header: Header::parse(&header_line).context(1)?,
             reader: reader,
-            current_row_num: 1
+            current_dir: PathBuf::new(),
+            current_row_num: 1,
         })
     }
 
@@ -161,8 +248,83 @@ impl<R: BufRead> Parser<R> {
         self.header.clone()
     }
 
-    pub fn advance<P: AsRef<Path>>(&mut self, path: P) -> Result<(), ParseError> {
-        Ok(())
+    pub fn advance<P: AsRef<Path>>(&mut self, path: P)
+        -> Result<Option<Entry>, ParseError>
+    {
+        // let mut line = self.next_line()?;
+        let mut path = path.as_ref();
+        let mut skip_files = !path.starts_with(&self.current_dir);
+        loop {
+            let line = if let Some(line) = self.next_line()? {
+                line
+            } else {
+                return Ok(None);
+            };
+            println!("advance: {:?}", String::from_utf8_lossy(&line));
+            self.current_row_num += 1;
+            if line.starts_with(b"/") {
+                let (dir_path, _) = parse_path(&line);
+                // let (dir_path, _) = parse_os_str(&line);
+                // let dir_path = OsStr::from_bytes(&line);
+                match dir_path.partial_cmp(path) {
+                    Some(Ordering::Less) => {
+                        if path.starts_with(&dir_path) {
+                            self.current_dir = dir_path.to_path_buf();
+                            // path = path.strip_prefix(dir_path).unwrap();
+                        } else {
+                            skip_files = true;
+                        }
+                    },
+                    Some(Ordering::Equal) => {
+                        return Ok(Some(Entry::Dir(dir_path.to_path_buf())));
+                    },
+                    Some(Ordering::Greater) => {
+                        return Ok(None);
+                    },
+                    None => unreachable!(),
+                }
+                continue;
+            }
+            if skip_files {
+                continue;
+            }
+            if line.starts_with(b"  ") {
+                let row = &line[2..];
+                let (file_path, _) = parse_path(row);
+                // println!("file: {:?}", file_path);
+                // println!("current dir: {:?}", &self.current_dir);
+                // println!("current file: {:?}", file_path.join(&self.current_dir));
+                match self.current_dir.join(file_path).partial_cmp(path) {
+                    Some(Ordering::Less) => {},
+                    Some(Ordering::Equal) => {
+                        return Ok(Some(Entry::parse(&line, &self.current_dir)
+                            .context(self.current_row_num)?));
+                    },
+                    Some(Ordering::Greater) => {
+                        return Ok(None);
+                    },
+                    None => unreachable!(),
+                }
+                continue;
+            }
+            return Err(ParseError::Parse(
+                format!("Expected \"/\" or \"  \" (two whitespaces)"),
+                self.current_row_num));
+        }
+        // println!("{:?}", dir_path);
+    }
+
+    fn next_line(&mut self) -> Result<Option<Vec<u8>>, ParseError> {
+        let mut line = vec!();
+        while line.is_empty() {
+            if self.reader.read_until(b'\n', &mut line)? == 0 {
+                return Ok(None);
+            }
+            if line.ends_with(b"\n") {
+                line.pop();
+            }
+        }
+        Ok(Some(line))
     }
 }
 
@@ -170,10 +332,17 @@ impl<R: BufRead> Iterator for Parser<R> {
     type Item = Result<Entry, ParseError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let mut line = vec!();
-        itry!(self.reader.read_until(b'\n', &mut line));
+        let mut line = if let Some(line) = itry!(self.next_line()) {
+            line
+        } else {
+            return None;
+        };
         self.current_row_num += 1;
-        let entry = itry!(Entry::parse(&line).context(self.current_row_num));
+        let entry = itry!(Entry::parse(&line, &self.current_dir)
+            .context(self.current_row_num));
+        if let Entry::Dir(ref dir_path) = entry {
+            self.current_dir = dir_path.clone();
+        }
         Some(Ok(entry))
     }
 }
@@ -185,18 +354,39 @@ impl<R: BufRead> Iterator for Parser<R> {
 //     Ok((unescape_hex(OsStr::from_bytes(field)), tail))
 // }
 
-fn parse_path_buf(data: &[u8]) -> PathBuf {
-    let s = parse_os_str(data);
-    PathBuf::from(s)
+fn parse_path<'a>(data: &'a [u8]) -> (&Path, &'a [u8]) {
+    let (p, tail) = parse_os_str(data);
+    (Path::new(p), tail)
+ }
+
+fn parse_path_buf<'a>(data: &'a [u8]) -> (PathBuf, &'a [u8]) {
+    let (p, tail) = parse_os_str(data);
+    (PathBuf::from(&p), tail)
 }
 
-fn parse_os_str<'a>(data: &'a [u8]) -> (Cow<'a, OsStr>, &'a [u8]) {
+fn parse_os_str<'a>(data: &'a [u8]) -> (&OsStr, &'a [u8]) {
     let (field, tail) = parse_field(data);
     (OsStr::from_bytes(field), tail)
 }
 
-fn parse_field<'a>(data: &'a [u8]) -> (Cow<'a, OsStr>, &'a [u8]) {
-    data.split(|c| c == b' ').next().unwrap()
+fn parse_u64<'a>(data: &'a [u8]) -> Result<(u64, &'a [u8]), ParseRowError> {
+    let (field, tail) = parse_field(data);
+    let v = try!(std::str::from_utf8(field).map_err(|e| {
+        ParseRowError(format!("Cannot parse integer {:?}: {}",
+            String::from_utf8_lossy(field).into_owned(), e))}));
+
+    let v = try!(u64::from_str_radix(v, 10).map_err(|e| {
+        ParseRowError(format!("Cannot parse integer {:?}: {}",
+            String::from_utf8_lossy(field).into_owned(), e))}));
+    Ok((v, tail))
+}
+
+fn parse_field<'a>(data: &'a [u8]) -> (&'a [u8], &'a [u8]) {
+    println!("data: {:?}", std::str::from_utf8(data).unwrap());
+    let mut parts = data.splitn(2, |c| *c == b' ');
+    let field = parts.next().unwrap();
+    let tail = parts.next().unwrap_or(&data[0..0]);
+    (field, tail)
 }
 
 fn split_by<'a, 'b>(v: &'a [u8], needle: &'b [u8]) -> (&'a [u8], &'a [u8]) {
