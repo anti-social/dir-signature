@@ -15,6 +15,7 @@ DIRSIGNATURE.v1 sha512/256 block_size=32768
 /subdir
   .hidden f 58394 24f72d3a930b5f7933ddd91a5c7cb7ba09a093f936a04bf6486c8b1763c59819 9ce28248299290fe84340d7821adf01b3b6a579ef827e1e58bc3949de4b7e5d9
   link s ../hello.txt
+c23f2579827456818fc855c458d1ad7339d144b57ee247a6628e4fc8e39958bb
 ";
     let reader = BufReader::new(Cursor::new(&content[..]));
     let mut signature_parser = Parser::new(reader).unwrap();
@@ -30,49 +31,54 @@ DIRSIGNATURE.v1 sha512/256 block_size=32768
             assert_eq!(dir, Path::new("/"));
         },
         _ => {
-            panic!("Expected directory");
+            panic!("Expected directory, found {:?}", entry);
         }
     }
 
     let entry = signature_parser.next().unwrap().unwrap();
     match entry {
-        Entry::File(path, size, mut hashes) => {
+        Entry::File(path, executable, size, mut hashes) => {
             assert_eq!(path, Path::new("/empty.txt"));
+            assert_eq!(executable, false);
             assert_eq!(size, 0);
             assert!(hashes.iter().next().is_none());
         },
         _ => {
-            panic!("Expected file")
+            panic!("Expected file, found {:?}", entry)
         }
     }
 
     let entry = signature_parser.next().unwrap().unwrap();
     match entry {
-        Entry::File(path, size, mut hashes) => {
+        Entry::File(path, executable, size, mut hashes) => {
             let mut hashes_iter = hashes.iter();
             assert_eq!(path, Path::new("/hello.txt"));
+            assert_eq!(executable, false);
             assert_eq!(size, 6);
             assert_eq!(hashes_iter.next().unwrap(),
                 "8dd499a36d950b8732f85a3bffbc8d8bee4a0af391e8ee2bb0aa0c4553b6c0fc");
             assert!(hashes_iter.next().is_none());
         },
         _ => {
-            panic!("Expected file")
+            panic!("Expected file, found {:?}", entry)
         }
     }
 
-    let entry = signature_parser.advance("/subdir/link").unwrap().unwrap();
+    let _ = signature_parser.next().unwrap().unwrap();
+    let _ = signature_parser.next().unwrap().unwrap();
+    let entry = signature_parser.next().unwrap().unwrap();
+    // let entry = signature_parser.advance("/subdir/link").unwrap().unwrap();
     match entry {
         Entry::Link(path, dest) => {
             assert_eq!(path, Path::new("/subdir/link"));
             assert_eq!(dest, Path::new("../hello.txt"));
         },
         _ => {
-            panic!("Expected symlink")
+            panic!("Expected symlink, found {:?}", entry)
         }
     }
 
-    assert!(signature_parser.advance("/subdir/link").unwrap().is_none());
+    // assert!(signature_parser.advance("/subdir/link").unwrap().is_none());
     assert!(signature_parser.next().is_none());
 }
 

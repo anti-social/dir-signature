@@ -143,28 +143,65 @@ impl Header {
 
 /// Entry hashes iterator
 #[derive(Debug)]
-pub struct Hashes(Vec<String>);
+pub struct Hashes {
+    // data: Vec<u8>,
+    data: String,
+    hash_len: usize,
+}
 
 impl Hashes {
-    pub fn parse(row: &[u8]) -> Result<Hashes, ParseRowError> {
-        let hashes_str = std::str::from_utf8(row)?.to_string();
-        if hashes_str.is_empty() {
-            Ok(Hashes(vec!()))
-        } else {
-            Ok(Hashes(hashes_str.split(' ')
-                .map(|h| h.to_string())
-                .collect::<Vec<_>>()))
-
+    fn parse(row: &[u8], hash_len: usize) -> Result<Hashes, ParseRowError> {
+        // Ok(Hashes {
+        //     data: row.to_vec(),
+        //     hash_length: 0
+        // })
+        let hashes_num = row.len() / hash_len;
+        if hashes_num != 0 && hashes_num - row.len() % hash_len != 1 {
+            return Err(ParseRowError(
+                format!("Invalid hashes string: {:?}",
+                    String::from_utf8_lossy(row))));
         }
+        Ok(Hashes {
+            data: Hashes::to_hashes_string(row)?,
+            hash_len: hash_len,
+        })
+        // let hashes_str = std::str::from_utf8(row)?.to_string();
+        // Ok(Hashes(vec!()))
+        // if hashes_str.is_empty() {
+        //     Ok(Hashes(vec!()))
+        // } else {
+        //     Ok(Hashes(hashes_str.split(' ')
+        //         .map(|h| h.to_string())
+        //         .collect::<Vec<_>>()))
+
+        // }
     }
 
-    pub fn iter(&self) -> Iter<String> {
-        self.0.iter()
+    fn to_hashes_string(row: &[u8]) -> Result<String, ParseRowError> {
+        // use fake_simd::u32x4;
+
+        // if row.iter().any(|c| ) {
+        //     return Err(ParseRowError(format!("Invalid hash")));
+        // }
+        // for c in row {
+        //     if  {
+        //         return Err(ParseRowError(format!("Invalid hash")));
+        //     }
+        // }
+        let s = unsafe {
+            std::str::from_utf8_unchecked(row).to_string()
+        };
+
+        Ok(s)
     }
+
+    // pub fn iter(&self) -> HashesIterator {
+    //     self.0.iter()
+    // }
 }
 
 // struct HashesIterator {
-//     hashes: String,
+//     hashes: Hashes,
 //     cur_pos: 0,
 // }
 
@@ -182,177 +219,122 @@ pub enum Entry {
     /// Direcory
     Dir(PathBuf),
     /// File
-    File(PathBuf, u64, Hashes),
+    File(PathBuf, bool, u64, Hashes),
     // File(PathBuf, bool, usize, Hashes),
     /// Link
     Link(PathBuf, PathBuf),
 }
 
 impl Entry {
-    pub fn parse(row: &[u8], cur_dir: &Path) -> Result<Entry, ParseRowError> {
-        let row = if row.ends_with(b"\n") {
-            &row[..row.len()-1]
-        } else {
-            row
-        };
-        // println!("row: {}", String::from_utf8_lossy(row));
+    fn parse(row: &[u8], current_dir: &Path, hash_len: usize)
+        -> Result<Option<Entry>, ParseRowError>
+    {
         let entry = if row.starts_with(b"/") {
             let (path, row) = parse_path_buf(row);
             Entry::Dir(path)
         } else if row.starts_with(b"  ") {
             let row = &row[2..];
-            let (path, row) = parse_path_buf(row); // TODO: optimize
-            let path = cur_dir.join(&path);
+            let (path, row) = parse_path(row);
+            let path = current_dir.join(&path);
             let (file_type, row) = parse_os_str(row);
             if file_type == "f" || file_type == "x" {
                 let (size, row) = parse_u64(row)?;
-                let hashes = Hashes::parse(row)?;
-                Entry::File(path, size, hashes)
+                let hashes = Hashes::parse(row, hash_len)?;
+                Entry::File(path, file_type == "x", size, hashes)
             } else if file_type == "s" {
                 let (dest, row) = parse_path_buf(row);
                 Entry::Link(path, dest)
             } else {
                 return Err(ParseRowError(
                     format!("Unknown file type: {:?}",
-                        String::from_utf8_lossy(file_type.as_bytes()))))
+                        String::from_utf8_lossy(file_type.as_bytes()))));
             }
         } else {
-            return Err(ParseRowError(
-                format!("Expected \"/\" or \"  \" (two whitespaces)")));
+            return Ok(None);
         };
-        Ok(entry)
+        Ok(Some(entry))
     }
 }
 
 /// v1 format reader
-pub struct Parser<R: BufRead + Seek> {
+pub struct Parser<R: BufRead> {
     header: Header,
+    // footer: Footer,
     reader: R,
+    hash_len: usize,
     current_dir: PathBuf,
     current_row_num: usize,
 }
 
-impl<R: BufRead + Seek> Parser<R> {
+// impl<R: BufRead + Seek> Parser<R> {
+//     pub fn reset(&mut self) -> Result<(), io::Error> {
+//         self.reader.seek(SeekFrom::Start(0))?;
+//         self.current_dir = PathBuf::new();
+//         self.current_row_num = 1;
+//         let _header_line = self.next_line();
+//         Ok(())
+//     }
+// }
+
+impl<R: BufRead> Parser<R> {
     pub fn new(mut reader: R) -> Result<Parser<R>, ParseError> {
         let mut header_line = vec!();
         reader.read_until(b'\n', &mut header_line)?;
+        let header = Header::parse(&header_line).context(1)?;
+        let hash_len = match header.hash_type {
+            HashType::Sha512_256 | HashType::Blake2b_256 => 64,
+        };
         Ok(Parser {
-            header: Header::parse(&header_line).context(1)?,
+            header: header,
             reader: reader,
+            hash_len: hash_len,
             current_dir: PathBuf::new(),
             current_row_num: 1,
         })
     }
 
-    pub fn reset(&mut self) -> Result<(), io::Error> {
-        self.reader.seek(SeekFrom::Start(0))?;
-        self.current_dir = PathBuf::new();
-        self.current_row_num = 1;
-        let _header_line = self.next_line();
-        Ok(())
-    }
-
     pub fn get_header(&self) -> Header {
         self.header.clone()
     }
-
-    pub fn advance<P: AsRef<Path>>(&mut self, path: P)
-        -> Result<Option<Entry>, ParseError>
-    {
-        // let mut line = self.next_line()?;
-        let mut path = path.as_ref();
-        let mut skip_files = !path.starts_with(&self.current_dir);
-        loop {
-            let line = if let Some(line) = self.next_line()? {
-                line
-            } else {
-                return Ok(None);
-            };
-            // println!("advance: {:?}", String::from_utf8_lossy(&line));
-            self.current_row_num += 1;
-            if line.starts_with(b"/") {
-                let (dir_path, _) = parse_path(&line);
-                // let (dir_path, _) = parse_os_str(&line);
-                // let dir_path = OsStr::from_bytes(&line);
-                match dir_path.partial_cmp(path) {
-                    Some(Ordering::Less) => {
-                        if path.starts_with(&dir_path) {
-                            self.current_dir = dir_path.to_path_buf();
-                            // path = path.strip_prefix(dir_path).unwrap();
-                        } else {
-                            skip_files = true;
-                        }
-                    },
-                    Some(Ordering::Equal) => {
-                        return Ok(Some(Entry::Dir(dir_path.to_path_buf())));
-                    },
-                    Some(Ordering::Greater) => {
-                        return Ok(None);
-                    },
-                    None => unreachable!(),
-                }
-                continue;
-            }
-            if skip_files {
-                continue;
-            }
-            if line.starts_with(b"  ") {
-                let row = &line[2..];
-                let (file_path, _) = parse_path(row);
-                // println!("file: {:?}", file_path);
-                // println!("current dir: {:?}", &self.current_dir);
-                // println!("current file: {:?}", file_path.join(&self.current_dir));
-                match self.current_dir.join(file_path).partial_cmp(path) {
-                    Some(Ordering::Less) => {},
-                    Some(Ordering::Equal) => {
-                        return Ok(Some(Entry::parse(&line, &self.current_dir)
-                            .context(self.current_row_num)?));
-                    },
-                    Some(Ordering::Greater) => {
-                        return Ok(None);
-                    },
-                    None => unreachable!(),
-                }
-                continue;
-            }
-            return Err(ParseError::Parse(
-                format!("Expected \"/\" or \"  \" (two whitespaces)"),
-                self.current_row_num));
-        }
-        // println!("{:?}", dir_path);
-    }
-
-    fn next_line(&mut self) -> Result<Option<Vec<u8>>, ParseError> {
-        let mut line = vec!();
-        while line.is_empty() {
-            if self.reader.read_until(b'\n', &mut line)? == 0 {
-                return Ok(None);
-            }
-            if line.ends_with(b"\n") {
-                line.pop();
-            }
-        }
-        Ok(Some(line))
-    }
 }
 
-impl<R: BufRead + Seek> Iterator for Parser<R> {
+impl<R: BufRead> Iterator for Parser<R> {
     type Item = Result<Entry, ParseError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let mut line = if let Some(line) = itry!(self.next_line()) {
-            line
-        } else {
+        let mut buf = vec!();
+        let read_len = itry!(read_line(&mut self.reader, &mut buf));
+        if read_len == 0 {
             return None;
-        };
-        self.current_row_num += 1;
-        let entry = itry!(Entry::parse(&line, &self.current_dir)
-            .context(self.current_row_num));
-        if let Entry::Dir(ref dir_path) = entry {
-            self.current_dir = dir_path.clone();
         }
-        Some(Ok(entry))
+        let row = &buf[..];
+        // println!("{}", String::from_utf8_lossy(row));
+        self.current_row_num += 1;
+        let entry = itry!(Entry::parse(row, &self.current_dir, self.hash_len)
+            .context(self.current_row_num));
+        match entry {
+            None => {
+                // TODO: parse footer
+                None
+            },
+            Some(entry) => {
+                if let Entry::Dir(ref dir_path) = entry {
+                    self.current_dir = dir_path.clone();
+                }
+                Some(Ok(entry))
+            },
+        }
     }
+}
+
+fn read_line<R: BufRead>(reader: &mut R, mut buf: &mut Vec<u8>)
+    -> Result<usize, io::Error>
+{
+    let n = reader.read_until(b'\n', &mut buf)?;
+    if buf.ends_with(b"\n") {
+        buf.pop();
+    }
+    Ok(n)
 }
 
 // fn parse_str<'a>(row: &'a str)
