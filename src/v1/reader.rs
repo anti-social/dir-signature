@@ -7,7 +7,7 @@ use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::fmt;
 use std::io;
-use std::io::BufRead;
+use std::io::{BufRead, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::slice::Iter;
 use std::str::{FromStr, Utf8Error};
@@ -111,7 +111,7 @@ impl Header {
                     format!("Invalid header: expected block_size attribute"))),
                 Some(_) => {
                     let v = block_size_kv.next().unwrap();
-                    println!("block_size: {:?}", v);
+                    // println!("block_size: {:?}", v);
                     u64::from_str_radix(v, 10)
                         .map_err(|e| ParseRowError(format!("Invalid header: {}", e)))?
                 },
@@ -195,7 +195,7 @@ impl Entry {
         } else {
             row
         };
-        println!("row: {}", String::from_utf8_lossy(row));
+        // println!("row: {}", String::from_utf8_lossy(row));
         let entry = if row.starts_with(b"/") {
             let (path, row) = parse_path_buf(row);
             Entry::Dir(path)
@@ -225,14 +225,14 @@ impl Entry {
 }
 
 /// v1 format reader
-pub struct Parser<R: BufRead> {
+pub struct Parser<R: BufRead + Seek> {
     header: Header,
     reader: R,
     current_dir: PathBuf,
     current_row_num: usize,
 }
 
-impl<R: BufRead> Parser<R> {
+impl<R: BufRead + Seek> Parser<R> {
     pub fn new(mut reader: R) -> Result<Parser<R>, ParseError> {
         let mut header_line = vec!();
         reader.read_until(b'\n', &mut header_line)?;
@@ -242,6 +242,14 @@ impl<R: BufRead> Parser<R> {
             current_dir: PathBuf::new(),
             current_row_num: 1,
         })
+    }
+
+    pub fn reset(&mut self) -> Result<(), io::Error> {
+        self.reader.seek(SeekFrom::Start(0))?;
+        self.current_dir = PathBuf::new();
+        self.current_row_num = 1;
+        let _header_line = self.next_line();
+        Ok(())
     }
 
     pub fn get_header(&self) -> Header {
@@ -260,7 +268,7 @@ impl<R: BufRead> Parser<R> {
             } else {
                 return Ok(None);
             };
-            println!("advance: {:?}", String::from_utf8_lossy(&line));
+            // println!("advance: {:?}", String::from_utf8_lossy(&line));
             self.current_row_num += 1;
             if line.starts_with(b"/") {
                 let (dir_path, _) = parse_path(&line);
@@ -328,7 +336,7 @@ impl<R: BufRead> Parser<R> {
     }
 }
 
-impl<R: BufRead> Iterator for Parser<R> {
+impl<R: BufRead + Seek> Iterator for Parser<R> {
     type Item = Result<Entry, ParseError>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -382,7 +390,7 @@ fn parse_u64<'a>(data: &'a [u8]) -> Result<(u64, &'a [u8]), ParseRowError> {
 }
 
 fn parse_field<'a>(data: &'a [u8]) -> (&'a [u8], &'a [u8]) {
-    println!("data: {:?}", std::str::from_utf8(data).unwrap());
+    // println!("data: {:?}", std::str::from_utf8(data).unwrap());
     let mut parts = data.splitn(2, |c| *c == b' ');
     let field = parts.next().unwrap();
     let tail = parts.next().unwrap_or(&data[0..0]);
