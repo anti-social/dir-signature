@@ -1,21 +1,20 @@
 use std;
 use std::borrow::Cow;
-use std::cmp::Ordering;
 use std::convert::From;
 use std::error::Error;
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::fmt;
 use std::io;
-use std::io::{BufRead, Seek, SeekFrom};
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
-use std::slice::Iter;
+use std::slice::Chunks;
 use std::str::{FromStr, Utf8Error};
 
 use quick_error::ResultExt;
 
 use ::HashType;
-use super::writer::MAGIC;
+use super::writer::{MAGIC, VERSION};
 
 
 macro_rules! itry {
@@ -44,19 +43,22 @@ impl Error for ParseRowError {
 
 impl From<Utf8Error> for ParseRowError {
     fn from(err: Utf8Error) -> ParseRowError {
-        ParseRowError(format!("expected valid utf8 string: {}", err))
+        ParseRowError(format!("Expected utf-8 string: {}", err))
     }
 }
 
 quick_error! {
+    /// The error type that can happen when parsing directory signature file
     #[derive(Debug)]
     pub enum ParseError {
-        Read(err: io::Error) {
+        /// An I/O operation error
+        Io(err: io::Error) {
             cause(err)
             description("error reading buffer")
             display("Error reading buffer: {}", err)
             from()
         }
+        /// Parsing error
         Parse(msg: String, row_num: usize) {
             description("parse error")
             display("Parse error at line {}: {}", row_num, msg)
@@ -67,7 +69,7 @@ quick_error! {
 }
 
 /// Represents header of the dir signature file
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Header {
     version: String,
     hash_type: HashType,
@@ -76,7 +78,7 @@ pub struct Header {
 
 impl Header {
     pub fn parse(row: &[u8]) -> Result<Header, ParseRowError> {
-        let line = std::str::from_utf8(row)?.trim_right_matches('\n');
+        let line = std::str::from_utf8(row)?;
         let mut parts = line.split(' ');
         let version = if let Some(signature) = parts.next() {
             let mut sig_parts = signature.splitn(2, '.');
@@ -88,39 +90,50 @@ impl Header {
                 }
             }
             if let Some(version) = sig_parts.next() {
+                if version != VERSION {
+                    return Err(ParseRowError(
+                        format!("Invalid version: expected {:?} but was {:?}",
+                            VERSION, version)));
+                }
                 version
             } else {
                 return Err(ParseRowError("Missing version".to_string()));
             }
         } else {
+            // it is unreachable
             return Err(ParseRowError("Invalid header".to_string()));
         };
         let hash_type = if let Some(hash_type_str) = parts.next() {
             HashType::from_str(hash_type_str)
-                .map_err(|e| ParseRowError(format!("{}", e)))?
+                .map_err(|e| ParseRowError(format!("Invalid hash type: {}", e)))?
         } else {
             return Err(ParseRowError(
-                "Invalid header: missing hash type".to_string()));
+                "Missing hash type".to_string()));
         };
         let block_size = if let Some(block_size_attr) = parts.next() {
             let mut block_size_kv = block_size_attr.splitn(2, '=');
             match block_size_kv.next() {
-                None => return Err(ParseRowError(
-                    format!("Invalid header: missing block_size"))),
-                Some(k) if k != "block_size" => return Err(ParseRowError(
-                    format!("Invalid header: expected block_size attribute"))),
+                None => {
+                    return Err(ParseRowError(format!("Missing block_size")));
+                },
+                Some(k) if k != "block_size" => {
+                    return Err(ParseRowError(
+                        format!("Expected block_size attribute")));
+                },
                 Some(_) => {
-                    let v = block_size_kv.next().unwrap();
-                    // println!("block_size: {:?}", v);
-                    u64::from_str_radix(v, 10)
-                        .map_err(|e| ParseRowError(format!("Invalid header: {}", e)))?
+                    match block_size_kv.next() {
+                        Some(v) => u64::from_str_radix(v, 10)
+                            .map_err(|e| ParseRowError(
+                                format!("Cannot parse block size {:?}: {}", v, e)))?,
+                        None => return Err(ParseRowError(
+                            format!("Missing block size"))),
+                    }
                 },
             }
         } else {
             return Err(ParseRowError(
-                format!("Invalid header: missing block size attribute")));
+                format!("Missing block size attribute")));
         };
-        // TODO: parse other fields
         Ok(Header {
             version: version.to_string(),
             hash_type: hash_type,
@@ -144,74 +157,46 @@ impl Header {
 /// Entry hashes iterator
 #[derive(Debug)]
 pub struct Hashes {
-    // data: Vec<u8>,
-    data: String,
-    hash_len: usize,
+    data: Vec<u8>,
+    digest_len: usize,
 }
 
 impl Hashes {
     fn parse(row: &[u8], hash_len: usize) -> Result<Hashes, ParseRowError> {
-        // Ok(Hashes {
-        //     data: row.to_vec(),
-        //     hash_length: 0
-        // })
-        let hashes_num = row.len() / hash_len;
-        if hashes_num != 0 && hashes_num - row.len() % hash_len != 1 {
-            return Err(ParseRowError(
-                format!("Invalid hashes string: {:?}",
-                    String::from_utf8_lossy(row))));
+        assert!(hash_len % 2 == 0);
+
+        let digest_len = hash_len / 2;
+        let hashes_num = (row.len() + 1) / (hash_len + 1);
+        let mut data = Vec::with_capacity(hashes_num * digest_len);
+        for hash in row.chunks(hash_len + 1) {
+            if hash.len() < hash_len {
+                return Err(ParseRowError(
+                    format!("Invalid hashes string: {:?}",
+                            String::from_utf8_lossy(row))));
+            }
+            for d in hash.chunks(2) {
+                if d.len() == 1 {
+                    if d[0] != b' ' {
+                        return Err(ParseRowError(
+                            format!("Invalid hashes string: {:?}",
+                                String::from_utf8_lossy(row))));
+                    }
+                    break;
+                }
+                data.push(parse_hex(d));
+            }
         }
+
         Ok(Hashes {
-            data: Hashes::to_hashes_string(row)?,
-            hash_len: hash_len,
+            data: data,
+            digest_len: digest_len,
         })
-        // let hashes_str = std::str::from_utf8(row)?.to_string();
-        // Ok(Hashes(vec!()))
-        // if hashes_str.is_empty() {
-        //     Ok(Hashes(vec!()))
-        // } else {
-        //     Ok(Hashes(hashes_str.split(' ')
-        //         .map(|h| h.to_string())
-        //         .collect::<Vec<_>>()))
-
-        // }
     }
 
-    fn to_hashes_string(row: &[u8]) -> Result<String, ParseRowError> {
-        // use fake_simd::u32x4;
-
-        // if row.iter().any(|c| ) {
-        //     return Err(ParseRowError(format!("Invalid hash")));
-        // }
-        // for c in row {
-        //     if  {
-        //         return Err(ParseRowError(format!("Invalid hash")));
-        //     }
-        // }
-        let s = unsafe {
-            std::str::from_utf8_unchecked(row).to_string()
-        };
-
-        Ok(s)
+    pub fn iter<'a>(&'a self) -> Chunks<'a, u8> {
+        self.data.chunks(self.digest_len)
     }
-
-    // pub fn iter(&self) -> HashesIterator {
-    //     self.0.iter()
-    // }
 }
-
-// struct HashesIterator {
-//     hashes: Hashes,
-//     cur_pos: 0,
-// }
-
-// impl Iterator for HashesIterator {
-//     type Item = Cow<'static, str>;
-
-//     fn next(&mut self) -> Option<Self::Item> {
-//         self.cur_pos
-//     }
-// }
 
 /// Represents an entry from dir signature file
 #[derive(Debug)]
@@ -230,7 +215,7 @@ impl Entry {
         -> Result<Option<Entry>, ParseRowError>
     {
         let entry = if row.starts_with(b"/") {
-            let (path, row) = parse_path_buf(row);
+            let (path, _) = parse_path_buf(row);
             Entry::Dir(path)
         } else if row.starts_with(b"  ") {
             let row = &row[2..];
@@ -242,7 +227,7 @@ impl Entry {
                 let hashes = Hashes::parse(row, hash_len)?;
                 Entry::File(path, file_type == "x", size, hashes)
             } else if file_type == "s" {
-                let (dest, row) = parse_path_buf(row);
+                let (dest, _) = parse_path_buf(row);
                 Entry::Link(path, dest)
             } else {
                 return Err(ParseRowError(
@@ -252,6 +237,11 @@ impl Entry {
         } else {
             return Ok(None);
         };
+        // if !row.is_empty() {
+        //     return Err(ParseRowError(
+        //         format!("Row is not fully exhausted: {:?}",
+        //             String::from_utf8_lossy(row))));
+        // }
         Ok(Some(entry))
     }
 }
@@ -259,51 +249,60 @@ impl Entry {
 /// v1 format reader
 pub struct Parser<R: BufRead> {
     header: Header,
-    // footer: Footer,
     reader: R,
+}
+
+impl<R: BufRead> Parser<R> {
+    /// Creates a directory signature parser (format v1)
+    /// Tries to parse header
+    pub fn new(mut reader: R) -> Result<Parser<R>, ParseError> {
+        let mut header_line = vec!();
+        read_line(&mut reader, &mut header_line)?;
+        let header = Header::parse(&header_line).context(1)?;
+        Ok(Parser {
+            header: header,
+            reader: reader,
+        })
+    }
+
+    /// Returns parsed `Header`
+    pub fn get_header(&self) -> Header {
+        self.header.clone()
+    }
+
+    /// Creates iterator over directory signature entries
+    pub fn iter(&mut self) -> EntryIterator<R> {
+        EntryIterator::new(&mut self.reader, self.header.hash_type)
+    }
+}
+
+pub struct EntryIterator<'a, R: 'a + BufRead> {
+    reader: &'a mut R,
     hash_len: usize,
     current_dir: PathBuf,
     current_row_num: usize,
 }
 
-// impl<R: BufRead + Seek> Parser<R> {
-//     pub fn reset(&mut self) -> Result<(), io::Error> {
-//         self.reader.seek(SeekFrom::Start(0))?;
-//         self.current_dir = PathBuf::new();
-//         self.current_row_num = 1;
-//         let _header_line = self.next_line();
-//         Ok(())
-//     }
-// }
-
-impl<R: BufRead> Parser<R> {
-    pub fn new(mut reader: R) -> Result<Parser<R>, ParseError> {
-        let mut header_line = vec!();
-        reader.read_until(b'\n', &mut header_line)?;
-        let header = Header::parse(&header_line).context(1)?;
-        let hash_len = match header.hash_type {
+impl<'a, R: BufRead> EntryIterator<'a, R> {
+    fn new(reader: &'a mut R, hash_type: HashType) -> EntryIterator<R> {
+        let hash_len = match hash_type {
             HashType::Sha512_256 | HashType::Blake2b_256 => 64,
         };
-        Ok(Parser {
-            header: header,
-            reader: reader,
+        EntryIterator {
+            reader: reader.by_ref(),
             hash_len: hash_len,
             current_dir: PathBuf::new(),
             current_row_num: 1,
-        })
-    }
-
-    pub fn get_header(&self) -> Header {
-        self.header.clone()
+        }
     }
 }
 
-impl<R: BufRead> Iterator for Parser<R> {
+impl<'a, R: BufRead> Iterator for EntryIterator<'a, R> {
     type Item = Result<Entry, ParseError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let mut buf = vec!();
-        let read_len = itry!(read_line(&mut self.reader, &mut buf));
+        let read_len = itry!(read_line(self.reader.by_ref(), &mut buf));
         if read_len == 0 {
             return None;
         }
@@ -337,21 +336,19 @@ fn read_line<R: BufRead>(reader: &mut R, mut buf: &mut Vec<u8>)
     Ok(n)
 }
 
-// fn parse_str<'a>(row: &'a str)
-//                  -> Result<(Cow<'a, str>, &'a str), ParseRowError>
-// {
-//     let (field, tail) = try!(parse_field(data, b" "));
-//     Ok((unescape_hex(OsStr::from_bytes(field)), tail))
-// }
-
-fn parse_path<'a>(data: &'a [u8]) -> (&Path, &'a [u8]) {
-    let (p, tail) = parse_os_str(data);
-    (Path::new(p), tail)
+fn parse_path<'a>(data: &'a [u8]) -> (Cow<Path>, &'a [u8]) {
+    let (path, tail) = parse_os_str(data);
+    let unescaped_path = match unescape_hex(path) {
+        Cow::Borrowed(p) => Cow::Borrowed(Path::new(p)),
+        Cow::Owned(p) => Cow::Owned(PathBuf::from(&p)),
+    };
+    (unescaped_path, tail)
  }
 
 fn parse_path_buf<'a>(data: &'a [u8]) -> (PathBuf, &'a [u8]) {
-    let (p, tail) = parse_os_str(data);
-    (PathBuf::from(&p), tail)
+    let (path, tail) = parse_os_str(data);
+    let unescaped_path = unescape_hex(path);
+    (PathBuf::from(&unescaped_path), tail)
 }
 
 fn parse_os_str<'a>(data: &'a [u8]) -> (&OsStr, &'a [u8]) {
@@ -372,30 +369,13 @@ fn parse_u64<'a>(data: &'a [u8]) -> Result<(u64, &'a [u8]), ParseRowError> {
 }
 
 fn parse_field<'a>(data: &'a [u8]) -> (&'a [u8], &'a [u8]) {
-    // println!("data: {:?}", std::str::from_utf8(data).unwrap());
     let mut parts = data.splitn(2, |c| *c == b' ');
     let field = parts.next().unwrap();
     let tail = parts.next().unwrap_or(&data[0..0]);
     (field, tail)
 }
 
-fn split_by<'a, 'b>(v: &'a [u8], needle: &'b [u8]) -> (&'a [u8], &'a [u8]) {
-    if needle.len() > v.len() {
-        return (&v[0..], &v[0..0]);
-    }
-    let mut i = 0;
-    while i <= v.len() - needle.len() {
-        let (head, tail) = v.split_at(i);
-        if tail.starts_with(needle) {
-            return (head, &tail[needle.len()..]);
-        }
-        i += 1;
-    }
-    return (&v[0..], &v[0..0]);
-}
-
 fn unescape_hex(s: &OsStr) -> Cow<OsStr> {
-    // return Cow::Borrowed(s);
     let (mut i, has_escapes) = {
         let bytes = s.as_bytes();
         let mut i = 0;
@@ -454,7 +434,67 @@ mod test {
     use std::borrow::Cow;
     use std::ffi::OsStr;
 
+    use ::HashType;
+    use super::{Header, ParseRowError};
     use super::{parse_hex, hex_to_digit, is_hex, is_hex_encoding, unescape_hex};
+
+    #[test]
+    fn test_header_parse() {
+        let res = Header::parse(b"");
+        assert!(matches!(res, Err(ParseRowError(_))));
+        let msg = res.unwrap_err().0;
+        assert!(msg.starts_with("Invalid signature:"),
+                "Real error message: {:?}", msg);
+
+        let res = Header::parse(b"\xff");
+        assert!(matches!(res, Err(ParseRowError(_))));
+        let msg = res.unwrap_err().0;
+        assert!(msg.starts_with("Expected utf-8 string:"),
+            "Real error message: {:?}", msg);
+
+        let res = Header::parse(b"DIRSIGNATURE");
+        assert!(matches!(res,
+            Err(ParseRowError(_))));
+        let msg = res.unwrap_err().0;
+        assert!(msg.starts_with("Missing version"),
+            "Real error message: {:?}", msg);
+
+        let res = Header::parse(b"DIRSIGNATURE.v2");
+        assert!(matches!(res, Err(ParseRowError(_))));
+        let msg = res.unwrap_err().0;
+        assert!(msg.starts_with("Invalid version:"),
+            "Real error message: {:?}", msg);
+
+        let res = Header::parse(b"DIRSIGNATURE.v1");
+        assert!(matches!(res, Err(ParseRowError(_))));
+        let msg = res.unwrap_err().0;
+        assert!(msg.starts_with("Missing hash type"),
+                "Real error message: {:?}", msg);
+
+        let res = Header::parse(b"DIRSIGNATURE.v1 sha512/25");
+        assert!(matches!(res, Err(ParseRowError(_))));
+        let msg = res.unwrap_err().0;
+        assert!(msg.starts_with("Invalid hash type: Unsupported hash algorithm"),
+            "Real error message: {:?}", msg);
+
+        let res = Header::parse(b"DIRSIGNATURE.v1 sha512/256 size=2");
+        assert!(matches!(res, Err(ParseRowError(_))));
+        let msg = res.unwrap_err().0;
+        assert!(msg.starts_with("Expected block_size attribute"),
+            "Real error message: {:?}", msg);
+
+        let res = Header::parse(b"DIRSIGNATURE.v1 sha512/256 block_size=dead");
+        assert!(matches!(res, Err(ParseRowError(_))));
+        let msg = res.unwrap_err().0;
+        assert!(msg.starts_with("Cannot parse block size \"dead\":"),
+            "Real error message: {:?}", msg);
+
+        let res = Header::parse(b"DIRSIGNATURE.v1 sha512/256 block_size=1234");
+        let header = res.unwrap();
+        assert_eq!(header.get_version(), "v1");
+        assert!(matches!(header.get_hash_type(), HashType::Sha512_256));
+        assert_eq!(header.get_block_size(), 1234);
+    }
 
     #[test]
     fn test_parse_hex() {

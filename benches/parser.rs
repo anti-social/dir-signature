@@ -55,7 +55,7 @@ fn bench_parser_iterator_ubuntu(bencher: &mut Bencher) {
         let idx_file = File::open("benches/ubuntu-xenial.idx").unwrap();
         let reader = BufReader::new(idx_file);
         let mut signature_parser = Parser::new(reader).unwrap();
-        for entry in signature_parser {
+        for entry in signature_parser.iter() {
             match entry.unwrap() {
                 Entry::Dir(_) => num_dirs += 1,
                 Entry::File(..) => num_files += 1,

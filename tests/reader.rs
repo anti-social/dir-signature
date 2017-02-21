@@ -1,6 +1,9 @@
 use std::io::{BufReader, Cursor};
 use std::path::Path;
 
+extern crate rustc_serialize;
+use rustc_serialize::hex::FromHex;
+
 extern crate dir_signature;
 use dir_signature::HashType;
 use dir_signature::v1::{Entry, Parser, ParseError};
@@ -14,7 +17,7 @@ DIRSIGNATURE.v1 sha512/256 block_size=32768
   hello.txt f 6 8dd499a36d950b8732f85a3bffbc8d8bee4a0af391e8ee2bb0aa0c4553b6c0fc
 /subdir
   .hidden f 58394 24f72d3a930b5f7933ddd91a5c7cb7ba09a093f936a04bf6486c8b1763c59819 9ce28248299290fe84340d7821adf01b3b6a579ef827e1e58bc3949de4b7e5d9
-  link s ../hello.txt
+  just\\x20link s ../hello.txt
 c23f2579827456818fc855c458d1ad7339d144b57ee247a6628e4fc8e39958bb
 ";
     let reader = BufReader::new(Cursor::new(&content[..]));
@@ -25,7 +28,9 @@ c23f2579827456818fc855c458d1ad7339d144b57ee247a6628e4fc8e39958bb
     assert_eq!(header.get_hash_type(), HashType::Sha512_256);
     assert_eq!(header.get_block_size(), 32768);
 
-    let entry = signature_parser.next().unwrap().unwrap();
+    let mut entry_iter = signature_parser.iter();
+
+    let entry = entry_iter.next().unwrap().unwrap();
     match entry {
         Entry::Dir(dir) => {
             assert_eq!(dir, Path::new("/"));
@@ -35,9 +40,9 @@ c23f2579827456818fc855c458d1ad7339d144b57ee247a6628e4fc8e39958bb
         }
     }
 
-    let entry = signature_parser.next().unwrap().unwrap();
+    let entry = entry_iter.next().unwrap().unwrap();
     match entry {
-        Entry::File(path, executable, size, mut hashes) => {
+        Entry::File(path, executable, size, hashes) => {
             assert_eq!(path, Path::new("/empty.txt"));
             assert_eq!(executable, false);
             assert_eq!(size, 0);
@@ -48,15 +53,16 @@ c23f2579827456818fc855c458d1ad7339d144b57ee247a6628e4fc8e39958bb
         }
     }
 
-    let entry = signature_parser.next().unwrap().unwrap();
+    let entry = entry_iter.next().unwrap().unwrap();
     match entry {
-        Entry::File(path, executable, size, mut hashes) => {
+        Entry::File(path, executable, size, hashes) => {
             let mut hashes_iter = hashes.iter();
             assert_eq!(path, Path::new("/hello.txt"));
             assert_eq!(executable, false);
             assert_eq!(size, 6);
             assert_eq!(hashes_iter.next().unwrap(),
-                "8dd499a36d950b8732f85a3bffbc8d8bee4a0af391e8ee2bb0aa0c4553b6c0fc");
+                &"8dd499a36d950b8732f85a3bffbc8d8bee4a0af391e8ee2bb0aa0c4553b6c0fc"
+                .from_hex().unwrap()[..]);
             assert!(hashes_iter.next().is_none());
         },
         _ => {
@@ -64,13 +70,12 @@ c23f2579827456818fc855c458d1ad7339d144b57ee247a6628e4fc8e39958bb
         }
     }
 
-    let _ = signature_parser.next().unwrap().unwrap();
-    let _ = signature_parser.next().unwrap().unwrap();
-    let entry = signature_parser.next().unwrap().unwrap();
-    // let entry = signature_parser.advance("/subdir/link").unwrap().unwrap();
+    let _ = entry_iter.next().unwrap().unwrap();
+    let _ = entry_iter.next().unwrap().unwrap();
+    let entry = entry_iter.next().unwrap().unwrap();
     match entry {
         Entry::Link(path, dest) => {
-            assert_eq!(path, Path::new("/subdir/link"));
+            assert_eq!(path, Path::new("/subdir/just link"));
             assert_eq!(dest, Path::new("../hello.txt"));
         },
         _ => {
@@ -78,8 +83,7 @@ c23f2579827456818fc855c458d1ad7339d144b57ee247a6628e4fc8e39958bb
         }
     }
 
-    // assert!(signature_parser.advance("/subdir/link").unwrap().is_none());
-    assert!(signature_parser.next().is_none());
+    assert!(entry_iter.next().is_none());
 }
 
 #[test]
