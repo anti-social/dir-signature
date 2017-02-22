@@ -4,6 +4,8 @@ use std::path::Path;
 extern crate rustc_serialize;
 use rustc_serialize::hex::FromHex;
 
+#[macro_use] extern crate matches;
+
 extern crate dir_signature;
 use dir_signature::HashType;
 use dir_signature::v1::{Entry, Parser, ParseError};
@@ -103,4 +105,18 @@ fn test_parser_invalid_header_signature() {
             panic!("Expected error");
         },
     }
+}
+
+#[test]
+fn test_parser_invalid_footer() {
+    let content = "\
+DIRSIGNATURE.v1 sha512/256 block_size=32768
+8dd499a36d950b8732f85a3bffbc8d8bee4a0af391e8ee2bb0aa0c4553b6c0fc";
+    let reader = BufReader::new(Cursor::new(&content[..]));
+    let mut parser = Parser::new(reader).unwrap();
+    let entry_res = parser.iter().next();
+    assert!(matches!(entry_res,
+            Some(Err(ParseError::Parse(ref msg, row_num)))
+            if msg.starts_with("Footer must be ended by a newline") && row_num == 2),
+        "Entry result was: {:?}", entry_res);
 }

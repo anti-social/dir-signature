@@ -47,6 +47,12 @@ impl From<Utf8Error> for ParseRowError {
     }
 }
 
+impl From<String> for ParseRowError {
+    fn from(err: String) -> ParseRowError {
+        ParseRowError(err)
+    }
+}
+
 quick_error! {
     /// The error type that can happen when parsing directory signature file
     #[derive(Debug)]
@@ -64,6 +70,14 @@ quick_error! {
             display("Parse error at line {}: {}", row_num, msg)
             context(row_num: usize, err: ParseRowError)
                 -> (err.0, row_num)
+        }
+    }
+}
+
+impl HashType {
+    fn get_size(self) -> usize {
+        match self {
+            HashType::Sha512_256 | HashType::Blake2b_256 => 32,
         }
     }
 }
@@ -154,6 +168,26 @@ impl Header {
     }
 }
 
+#[derive(Debug)]
+pub struct Footer(Vec<u8>);
+
+impl Footer {
+    fn parse(row: &[u8], hash_type: HashType)
+        -> Result<Footer, ParseRowError>
+    {
+        let digest_len = hash_type.get_size();
+        let hash_len = digest_len * 2;
+        if row.len() != hash_len {
+            return Err(ParseRowError(
+                format!("Footer length is {}, expected {}",
+                    row.len(), hash_len)));
+        }
+        let mut data = Vec::with_capacity(digest_len);
+        parse_hash(row, hash_len, &mut data)?;
+        Ok(Footer(data))
+    }
+}
+
 /// Entry hashes iterator
 #[derive(Debug)]
 pub struct Hashes {
@@ -162,28 +196,30 @@ pub struct Hashes {
 }
 
 impl Hashes {
-    fn parse(row: &[u8], hash_len: usize) -> Result<Hashes, ParseRowError> {
-        assert!(hash_len % 2 == 0);
+    fn parse(row: &[u8], file_size: u64, hash_type: HashType, block_size: u64)
+        -> Result<Hashes, ParseRowError>
+    {
+        let expected_hashes_num = ((file_size + block_size - 1) / block_size) as usize;
 
-        let digest_len = hash_len / 2;
+        let digest_len = hash_type.get_size();
+        let hash_len = digest_len * 2;
         let hashes_num = (row.len() + 1) / (hash_len + 1);
+        if row.len() != 0 && (row.len() + 1) % (hash_len + 1) != 0 {
+            return Err(ParseRowError(
+                format!("Hashes string length is {}, one hash should have exactly {} symbols",
+                    row.len(), hash_len)));
+        }
+        if hashes_num != expected_hashes_num {
+            return Err(ParseRowError(format!("Expected {} hashes but found {}",
+                expected_hashes_num, hashes_num)));
+        }
         let mut data = Vec::with_capacity(hashes_num * digest_len);
         for hash in row.chunks(hash_len + 1) {
-            if hash.len() < hash_len {
+            parse_hash(&hash[..hash_len], hash_len, &mut data)?;
+            if hash.len() == hash_len + 1 && hash[hash_len] != b' ' {
                 return Err(ParseRowError(
-                    format!("Invalid hashes string: {:?}",
-                            String::from_utf8_lossy(row))));
-            }
-            for d in hash.chunks(2) {
-                if d.len() == 1 {
-                    if d[0] != b' ' {
-                        return Err(ParseRowError(
-                            format!("Invalid hashes string: {:?}",
-                                String::from_utf8_lossy(row))));
-                    }
-                    break;
-                }
-                data.push(parse_hex(d));
+                    format!("Invalid hashes delimiter: {:?}",
+                        String::from_utf8_lossy(&hash[hash_len-1..hash_len]))));
             }
         }
 
@@ -211,24 +247,24 @@ pub enum Entry {
 }
 
 impl Entry {
-    fn parse(row: &[u8], current_dir: &Path, hash_len: usize)
+    fn parse(row: &[u8], current_dir: &Path, hash_type: HashType, block_size: u64)
         -> Result<Option<Entry>, ParseRowError>
     {
-        let entry = if row.starts_with(b"/") {
-            let (path, _) = parse_path_buf(row);
-            Entry::Dir(path)
+        let (entry, tail) = if row.starts_with(b"/") {
+            let (path, row) = parse_path_buf(row);
+            (Entry::Dir(path), row)
         } else if row.starts_with(b"  ") {
             let row = &row[2..];
             let (path, row) = parse_path(row);
             let path = current_dir.join(&path);
             let (file_type, row) = parse_os_str(row);
             if file_type == "f" || file_type == "x" {
-                let (size, row) = parse_u64(row)?;
-                let hashes = Hashes::parse(row, hash_len)?;
-                Entry::File(path, file_type == "x", size, hashes)
+                let (file_size, row) = parse_u64(row)?;
+                let hashes = Hashes::parse(row, file_size, hash_type, block_size)?;
+                (Entry::File(path, file_type == "x", file_size, hashes), "".as_bytes())
             } else if file_type == "s" {
-                let (dest, _) = parse_path_buf(row);
-                Entry::Link(path, dest)
+                let (dest, row) = parse_path_buf(row);
+                (Entry::Link(path, dest), row)
             } else {
                 return Err(ParseRowError(
                     format!("Unknown file type: {:?}",
@@ -237,11 +273,11 @@ impl Entry {
         } else {
             return Ok(None);
         };
-        // if !row.is_empty() {
-        //     return Err(ParseRowError(
-        //         format!("Row is not fully exhausted: {:?}",
-        //             String::from_utf8_lossy(row))));
-        // }
+        if !tail.is_empty() {
+            return Err(ParseRowError(
+                format!("Row is not fully consumed: {:?}",
+                    String::from_utf8_lossy(tail))));
+        }
         Ok(Some(entry))
     }
 }
@@ -272,25 +308,27 @@ impl<R: BufRead> Parser<R> {
 
     /// Creates iterator over directory signature entries
     pub fn iter(&mut self) -> EntryIterator<R> {
-        EntryIterator::new(&mut self.reader, self.header.hash_type)
+        EntryIterator::new(&mut self.reader,
+            self.header.hash_type, self.header.block_size)
     }
 }
 
 pub struct EntryIterator<'a, R: 'a + BufRead> {
     reader: &'a mut R,
-    hash_len: usize,
+    hash_type: HashType,
+    block_size: u64,
     current_dir: PathBuf,
     current_row_num: usize,
 }
 
 impl<'a, R: BufRead> EntryIterator<'a, R> {
-    fn new(reader: &'a mut R, hash_type: HashType) -> EntryIterator<R> {
-        let hash_len = match hash_type {
-            HashType::Sha512_256 | HashType::Blake2b_256 => 64,
-        };
+    fn new(reader: &'a mut R, hash_type: HashType, block_size: u64)
+        -> EntryIterator<R>
+    {
         EntryIterator {
             reader: reader.by_ref(),
-            hash_len: hash_len,
+            hash_type: hash_type,
+            block_size: block_size,
             current_dir: PathBuf::new(),
             current_row_num: 1,
         }
@@ -302,18 +340,27 @@ impl<'a, R: BufRead> Iterator for EntryIterator<'a, R> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let mut buf = vec!();
-        let read_len = itry!(read_line(self.reader.by_ref(), &mut buf));
-        if read_len == 0 {
-            return None;
-        }
+        let is_last = itry!(read_line(self.reader.by_ref(), &mut buf));
         let row = &buf[..];
-        // println!("{}", String::from_utf8_lossy(row));
         self.current_row_num += 1;
-        let entry = itry!(Entry::parse(row, &self.current_dir, self.hash_len)
+        let entry = itry!(Entry::parse(
+                row, &self.current_dir, self.hash_type, self.block_size)
             .context(self.current_row_num));
         match entry {
             None => {
-                // TODO: parse footer
+                let _footer = itry!(Footer::parse(row, self.hash_type)
+                    .context(self.current_row_num));
+                if is_last {
+                    return Some(Err(ParseError::Parse(
+                        format!("Footer must be ended by a newline"),
+                        self.current_row_num)));
+                }
+                let mut test_buf = [0; 1];
+                if itry!(self.reader.read(&mut test_buf)) != 0 {
+                    return Some(Err(ParseError::Parse(
+                        format!("Found extra lines after the footer"),
+                        self.current_row_num)));
+                }
                 None
             },
             Some(entry) => {
@@ -327,13 +374,15 @@ impl<'a, R: BufRead> Iterator for EntryIterator<'a, R> {
 }
 
 fn read_line<R: BufRead>(reader: &mut R, mut buf: &mut Vec<u8>)
-    -> Result<usize, io::Error>
+    -> Result<bool, io::Error>
 {
-    let n = reader.read_until(b'\n', &mut buf)?;
+    let _ = reader.read_until(b'\n', &mut buf)?;
     if buf.ends_with(b"\n") {
         buf.pop();
+        Ok(false)
+    } else {
+        Ok(true)
     }
-    Ok(n)
 }
 
 fn parse_path<'a>(data: &'a [u8]) -> (Cow<Path>, &'a [u8]) {
@@ -375,6 +424,19 @@ fn parse_field<'a>(data: &'a [u8]) -> (&'a [u8], &'a [u8]) {
     (field, tail)
 }
 
+fn parse_hash<'a>(hash: &'a [u8], hash_len: usize, mut data: &mut Vec<u8>)
+                  -> Result<(), ParseRowError>
+{
+    if hash.len() != hash_len {
+        return Err(ParseRowError(
+            format!("Invalid hash: {:?}", hash)));
+    }
+    for d in hash.chunks(2) {
+        data.push(parse_hex(d)?);
+    }
+    Ok(())
+}
+
 fn unescape_hex(s: &OsStr) -> Cow<OsStr> {
     let (mut i, has_escapes) = {
         let bytes = s.as_bytes();
@@ -396,7 +458,7 @@ fn unescape_hex(s: &OsStr) -> Cow<OsStr> {
     v.extend_from_slice(&bytes[..i]);
     while i < bytes.len() {
         if is_hex_encoding(&bytes[i..]) {
-            let c = parse_hex(&bytes[i + 2..]);
+            let c = parse_hex_unsafe(&bytes[i + 2..]);
             v.push(c);
             i += 4;
         } else {
@@ -407,11 +469,23 @@ fn unescape_hex(s: &OsStr) -> Cow<OsStr> {
     Cow::Owned(OsString::from_vec(v))
 }
 
-fn parse_hex(v: &[u8]) -> u8 {
-    (hex_to_digit(v[0]) << 4) | hex_to_digit(v[1])
+fn parse_hex(v: &[u8]) -> Result<u8, String> {
+    Ok((hex_to_digit(v[0])? << 4) | hex_to_digit(v[1])?)
 }
 
-fn hex_to_digit(v: u8) -> u8 {
+fn hex_to_digit(v: u8) -> Result<u8, String> {
+    Ok(match v {
+        b'0'...b'9' => v & 0x0f,
+        b'a'...b'f' | b'A'...b'F' => (v & 0x0f) + 9,
+        _ => return Err(format!("Invalid hex character ord: {:?}", v))
+    })
+}
+
+fn parse_hex_unsafe(v: &[u8]) -> u8 {
+    (hex_to_digit_unsafe(v[0]) << 4) | hex_to_digit_unsafe(v[1])
+}
+
+fn hex_to_digit_unsafe(v: u8) -> u8 {
     if v >= b'0' && v <= b'9' {
         return v & 0x0f;
     }
@@ -433,61 +507,63 @@ fn is_hex(c: u8) -> bool {
 mod test {
     use std::borrow::Cow;
     use std::ffi::OsStr;
+    use std::path::Path;
+
+    use rustc_serialize::hex::FromHex;
 
     use ::HashType;
-    use super::{Header, ParseRowError};
-    use super::{parse_hex, hex_to_digit, is_hex, is_hex_encoding, unescape_hex};
+    use super::{Entry, Footer, Hashes, Header, ParseRowError};
+    use super::{parse_hex, is_hex, is_hex_encoding, unescape_hex};
 
     #[test]
     fn test_header_parse() {
         let res = Header::parse(b"");
-        assert!(matches!(res, Err(ParseRowError(_))));
-        let msg = res.unwrap_err().0;
-        assert!(msg.starts_with("Invalid signature:"),
-                "Real error message: {:?}", msg);
+        assert!(matches!(res,
+                Err(ParseRowError(ref msg))
+                if msg.starts_with("Invalid signature:")),
+            "Result was: {:?}", res);
 
         let res = Header::parse(b"\xff");
-        assert!(matches!(res, Err(ParseRowError(_))));
-        let msg = res.unwrap_err().0;
-        assert!(msg.starts_with("Expected utf-8 string:"),
-            "Real error message: {:?}", msg);
+        assert!(matches!(res,
+                Err(ParseRowError(ref msg))
+                if msg.starts_with("Expected utf-8 string:")),
+            "Result was: {:?}", res);
 
         let res = Header::parse(b"DIRSIGNATURE");
         assert!(matches!(res,
-            Err(ParseRowError(_))));
-        let msg = res.unwrap_err().0;
-        assert!(msg.starts_with("Missing version"),
-            "Real error message: {:?}", msg);
+                Err(ParseRowError(ref msg))
+                if msg.starts_with("Missing version")),
+            "Result was: {:?}", res);
 
         let res = Header::parse(b"DIRSIGNATURE.v2");
-        assert!(matches!(res, Err(ParseRowError(_))));
-        let msg = res.unwrap_err().0;
-        assert!(msg.starts_with("Invalid version:"),
-            "Real error message: {:?}", msg);
+        assert!(matches!(res,
+                Err(ParseRowError(ref msg))
+                if msg.starts_with("Invalid version:")),
+            "Result was: {:?}", res);
 
         let res = Header::parse(b"DIRSIGNATURE.v1");
-        assert!(matches!(res, Err(ParseRowError(_))));
-        let msg = res.unwrap_err().0;
-        assert!(msg.starts_with("Missing hash type"),
-                "Real error message: {:?}", msg);
+        assert!(matches!(res,
+                Err(ParseRowError(ref msg))
+                if msg.starts_with("Missing hash type")),
+            "Result was: {:?}", res);
 
         let res = Header::parse(b"DIRSIGNATURE.v1 sha512/25");
-        assert!(matches!(res, Err(ParseRowError(_))));
-        let msg = res.unwrap_err().0;
-        assert!(msg.starts_with("Invalid hash type: Unsupported hash algorithm"),
-            "Real error message: {:?}", msg);
+        assert!(matches!(res,
+                Err(ParseRowError(ref msg))
+                if msg.starts_with("Invalid hash type: Unsupported hash algorithm")),
+            "Result was: {:?}", res);
 
         let res = Header::parse(b"DIRSIGNATURE.v1 sha512/256 size=2");
-        assert!(matches!(res, Err(ParseRowError(_))));
-        let msg = res.unwrap_err().0;
-        assert!(msg.starts_with("Expected block_size attribute"),
-            "Real error message: {:?}", msg);
+        assert!(matches!(res,
+                Err(ParseRowError(ref msg))
+                if msg.starts_with("Expected block_size attribute")),
+            "Result was: {:?}", res);
 
         let res = Header::parse(b"DIRSIGNATURE.v1 sha512/256 block_size=dead");
-        assert!(matches!(res, Err(ParseRowError(_))));
-        let msg = res.unwrap_err().0;
-        assert!(msg.starts_with("Cannot parse block size \"dead\":"),
-            "Real error message: {:?}", msg);
+        assert!(matches!(res,
+                Err(ParseRowError(ref msg))
+                if msg.starts_with("Cannot parse block size \"dead\":")),
+            "Result was: {:?}", res);
 
         let res = Header::parse(b"DIRSIGNATURE.v1 sha512/256 block_size=1234");
         let header = res.unwrap();
@@ -497,26 +573,115 @@ mod test {
     }
 
     #[test]
-    fn test_parse_hex() {
-        assert_eq!(parse_hex(b"00"), 0);
-        assert_eq!(parse_hex(b"01"), 1);
-        assert_eq!(parse_hex(b"0A"), 10);
-        assert_eq!(parse_hex(b"0e"), 14);
-        assert_eq!(parse_hex(b"1f"), 31);
-        assert_eq!(parse_hex(b"7f"), 127);
-        assert_eq!(parse_hex(b"fF"), 255);
-        assert_eq!(parse_hex(b"00test"), 0);
+    fn test_entry_parse() {
+        let t = HashType::Sha512_256;
+        let b = 32768;
+
+        let res = Entry::parse(b"", Path::new(""), t, b);
+        assert!(matches!(res, Ok(None)));
+
+        let res = Entry::parse(b"/test", Path::new("/dir"), t, b);
+        assert!(matches!(res,
+                Ok(Some(Entry::Dir(ref dir_path)))
+                if dir_path == Path::new("/test")),
+            "Result was: {:?}", res);
+
+        let res = Entry::parse(b"  test f 0", Path::new("/dir"), t, b);
+        assert!(matches!(res,
+                Ok(Some(Entry::File(ref path, exe, len, _)))
+                if path == Path::new("/dir/test") && !exe && len == 0),
+            "Result was: {:?}", res);
+
+        let res = Entry::parse(
+            b"  test x 100 8dd499a36d950b8732f85a3bffbc8d8bee4a0af391e8ee2bb0aa0c4553b6c0fc",
+            Path::new("/dir"), t, b);
+        assert!(matches!(res,
+                Ok(Some(Entry::File(ref path, exe, len, _)))
+                if path == Path::new("/dir/test") && exe && len == 100),
+            "Result was: {:?}", res);
+
+        let res = Entry::parse(b"  test s ../dest", Path::new("/dir"), t, b);
+        assert!(matches!(res,
+                Ok(Some(Entry::Link(ref path, ref dest)))
+                if path == Path::new("/dir/test") && dest == Path::new("../dest")),
+            "Result was: {:?}", res);
+
+        let res = Entry::parse(b"  test l ../dest", Path::new("/dir"), t, b);
+        assert!(matches!(res,
+                Err(ParseRowError(ref msg))
+                if msg.starts_with("Unknown file type: \"l\"")),
+            "Result was: {:?}", res);
+
+        let res = Entry::parse(b"  test s  ../dest", Path::new("/dir"), t, b);
+        assert!(matches!(res,
+                Err(ParseRowError(ref msg))
+                if msg.starts_with("Row is not fully consumed: \"../dest\"")),
+            "Result was: {:?}", res);
     }
 
     #[test]
-    fn test_hex_to_digit() {
-        assert_eq!(hex_to_digit(b'0'), 0);
-        assert_eq!(hex_to_digit(b'1'), 1);
-        assert_eq!(hex_to_digit(b'9'), 9);
-        assert_eq!(hex_to_digit(b'a'), 10);
-        assert_eq!(hex_to_digit(b'A'), 10);
-        assert_eq!(hex_to_digit(b'f'), 15);
-        assert_eq!(hex_to_digit(b'F'), 15);
+    fn test_hashes_parse() {
+        let res = Hashes::parse(
+            b"8dd499a36d950b8732f85a3bffbc8d8bee4a0af391e8ee2bb0aa0c4553b6c0fc",
+            100000, HashType::Sha512_256, 32768);
+        assert!(matches!(res,
+                Err(ParseRowError(ref msg))
+                if msg.starts_with("Expected 4 hashes but found 1")),
+            "Result was: {:?}", res);
+
+        let res = Hashes::parse(
+            b"8dd499a36d950b8732f85a3bffbc8d8bee4a0af391e8ee2bb0aa0c4553b6c0",
+            100000, HashType::Sha512_256, 32768);
+        assert!(matches!(res,
+                Err(ParseRowError(ref msg))
+                if msg.starts_with("Hashes string length is 62")),
+            "Result was: {:?}", res);
+
+        let res = Hashes::parse(
+            b"8dd499a36d950b8732f85a3bffbc8d8bee4a0af391e8ee2bb0aa0c4553b6c0fc ",
+            1, HashType::Sha512_256, 32768);
+        assert!(matches!(res,
+                Err(ParseRowError(ref msg))
+                if msg.starts_with("Hashes string length is 65")),
+            "Result was: {:?}", res);
+    }
+
+    #[test]
+    fn test_footer_parse() {
+        let res = Footer::parse(
+            b"8dd499a36d950b8732f85a3bffbc8d8bee4a0af391e8ee2bb0aa0c4553b6c0fc",
+            HashType::Sha512_256);
+        assert!(matches!(res,
+                Ok(Footer(ref data))
+                if data == &"8dd499a36d950b8732f85a3bffbc8d8bee4a0af391e8ee2bb0aa0c4553b6c0fc".from_hex().unwrap()),
+            "Result was: {:?}", res);
+
+        let res = Footer::parse(b"", HashType::Sha512_256);
+        assert!(matches!(res,
+                Err(ParseRowError(ref msg))
+                if msg.starts_with("Footer length is 0, expected 64")),
+            "Result was: {:?}", res);
+
+        let res = Footer::parse(
+            b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            HashType::Sha512_256);
+        assert!(matches!(res,
+                Err(ParseRowError(ref msg))
+                if msg.starts_with("Invalid hex character ord: 120")),
+            "Result was: {:?}", res);
+    }
+
+    #[test]
+    fn test_parse_hex() {
+        assert_eq!(parse_hex(b"00").unwrap(), 0);
+        assert_eq!(parse_hex(b"01").unwrap(), 1);
+        assert_eq!(parse_hex(b"0A").unwrap(), 10);
+        assert_eq!(parse_hex(b"0e").unwrap(), 14);
+        assert_eq!(parse_hex(b"1f").unwrap(), 31);
+        assert_eq!(parse_hex(b"7f").unwrap(), 127);
+        assert_eq!(parse_hex(b"fF").unwrap(), 255);
+        assert_eq!(parse_hex(b"00test").unwrap(), 0);
+        assert!(parse_hex(b"0x").is_err());
     }
 
     #[test]

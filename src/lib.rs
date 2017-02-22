@@ -37,6 +37,9 @@ extern crate fake_simd;
 
 #[cfg(test)]
 #[macro_use] extern crate matches;
+#[cfg(test)]
+extern crate rustc_serialize;
+
 
 pub mod v1;
 mod error;
