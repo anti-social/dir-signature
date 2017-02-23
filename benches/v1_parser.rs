@@ -16,7 +16,7 @@ fn bench_parser_iterator_ubuntu(bencher: &mut Bencher) {
     let ubuntu_idx_path = Path::new("benches/ubuntu-xenial.v1.idx");
     if !ubuntu_idx_path.exists() {
         println!("");
-        println!("To generate direcotry signature run: vagga gen-ubuntu-idx");
+        println!("To generate direcotry signature run: vagga gen-test-data");
         process::exit(1);
     }
 

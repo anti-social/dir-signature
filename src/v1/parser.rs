@@ -26,32 +26,62 @@ macro_rules! itry {
     }
 }
 
-#[derive(Debug)]
-pub struct ParseRowError(String);
-
-impl fmt::Display for ParseRowError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "Parse row error: {}", self.0)
+quick_error! {
+    #[derive(Debug)]
+    pub enum ParseRowError {
+        Signature(msg: String) {
+            display("Invalid signature: {}", msg)
+        }
+        Version(msg: String) {
+            display("Invalid version: {}", msg)
+        }
+        HashType(msg: String) {
+            display("Invalid hash type: {}", msg)
+        }
+        BlockSize(msg: String) {
+            display("Invalid block size: {}", msg)
+        }
+        Header(msg: String) {
+            display("Invalid header: {}", msg)
+        }
+        // ParseRowError(format!("Cannot parse integer {:?}: {}",
+        //                       String::from_utf8_lossy(field).into_owned(), e))}));
+        // ParseRowError(format!("Cannot parse integer {:?}: {}",
+        //                       String::from_utf8_lossy(field).into_owned(), e))}));
+        // format!("Unknown file type: {:?}",
+        // format!("Row is not fully consumed: {:?}",
+        // format!("Expected {} hashes but found {}",
+        Hash(hash: Vec<u8>) {
+            display("Invalid hash: {}", std::str::from_utf8_lossy(hash))
+        }
+        Entry(msg: String) {}
+        Checksum(msg: String) {}
     }
 }
 
-impl Error for ParseRowError {
-    fn description(&self) -> &str {
-        return &self.0;
-    }
-}
+// impl fmt::Display for ParseRowError {
+//     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+//         write!(f, "Parse row error: {}", self.0)
+//     }
+// }
 
-impl From<Utf8Error> for ParseRowError {
-    fn from(err: Utf8Error) -> ParseRowError {
-        ParseRowError(format!("Expected utf-8 string: {}", err))
-    }
-}
+// impl Error for ParseRowError {
+//     fn description(&self) -> &str {
+//         return &self.0;
+//     }
+// }
 
-impl From<String> for ParseRowError {
-    fn from(err: String) -> ParseRowError {
-        ParseRowError(err)
-    }
-}
+// impl From<Utf8Error> for ParseRowError {
+//     fn from(err: Utf8Error) -> ParseRowError {
+//         ParseRowError(format!("Expected utf-8 string: {}", err))
+//     }
+// }
+
+// impl From<String> for ParseRowError {
+//     fn from(err: String) -> ParseRowError {
+//         ParseRowError(err)
+//     }
+// }
 
 quick_error! {
     /// The error type that can happen when parsing directory signature file
@@ -65,19 +95,11 @@ quick_error! {
             from()
         }
         /// Parsing error
-        Parse(msg: String, row_num: usize) {
+        Parse(err: ParseRowError, row_num: usize) {
             description("parse error")
             display("Parse error at line {}: {}", row_num, msg)
             context(row_num: usize, err: ParseRowError)
-                -> (err.0, row_num)
-        }
-    }
-}
-
-impl HashType {
-    fn get_size(self) -> usize {
-        match self {
-            HashType::Sha512_256 | HashType::Blake2b_256 => 32,
+                -> (err, row_num)
         }
     }
 }
@@ -98,54 +120,52 @@ impl Header {
             let mut sig_parts = signature.splitn(2, '.');
             if let Some(magic) = sig_parts.next() {
                 if magic != MAGIC {
-                    return Err(ParseRowError(
-                        format!("Invalid signature: expected {:?} but was {:?}",
-                            MAGIC, magic)));
+                    return Err(ParseRowError::Signature(
+                        format!("Expected {:?} but was {:?}", MAGIC, magic)));
                 }
             }
             if let Some(version) = sig_parts.next() {
                 if version != VERSION {
-                    return Err(ParseRowError(
-                        format!("Invalid version: expected {:?} but was {:?}",
+                    return Err(ParseRowError::Version(
+                        format!("Expected {:?} but was {:?}",
                             VERSION, version)));
                 }
                 version
             } else {
-                return Err(ParseRowError("Missing version".to_string()));
+                return Err(ParseRowError::Version(format!("Missing version")));
             }
         } else {
-            // it is unreachable
-            return Err(ParseRowError("Invalid header".to_string()));
+            return Err(ParseRowError::Header(format!("Unreachable")));
         };
         let hash_type = if let Some(hash_type_str) = parts.next() {
             HashType::from_str(hash_type_str)
-                .map_err(|e| ParseRowError(format!("Invalid hash type: {}", e)))?
+                .map_err(|e| ParseRowError::HashType(format!("{}", e)))?
         } else {
-            return Err(ParseRowError(
-                "Missing hash type".to_string()));
+            return Err(ParseRowError::HashType(format!("Missing hash type")));
         };
         let block_size = if let Some(block_size_attr) = parts.next() {
             let mut block_size_kv = block_size_attr.splitn(2, '=');
             match block_size_kv.next() {
                 None => {
-                    return Err(ParseRowError(format!("Missing block_size")));
+                    return Err(ParseRowError::BlockSize(
+                        format!("Missing block_size")));
                 },
                 Some(k) if k != "block_size" => {
-                    return Err(ParseRowError(
+                    return Err(ParseRowError::BlockSize(
                         format!("Expected block_size attribute")));
                 },
                 Some(_) => {
                     match block_size_kv.next() {
                         Some(v) => u64::from_str_radix(v, 10)
-                            .map_err(|e| ParseRowError(
+                            .map_err(|e| ParseRowError::BlockSize(
                                 format!("Cannot parse block size {:?}: {}", v, e)))?,
-                        None => return Err(ParseRowError(
+                        None => return Err(ParseRowError::BlockSize(
                             format!("Missing block size"))),
                     }
                 },
             }
         } else {
-            return Err(ParseRowError(
+            return Err(ParseRowError::BlockSize(
                 format!("Missing block size attribute")));
         };
         Ok(Header {
@@ -178,10 +198,10 @@ impl Footer {
     fn parse(row: &[u8], hash_type: HashType)
         -> Result<Footer, ParseRowError>
     {
-        let digest_len = hash_type.get_size();
+        let digest_len = hash_type.output_bytes();
         let hash_len = digest_len * 2;
         if row.len() != hash_len {
-            return Err(ParseRowError(
+            return Err(ParseRowError::Footer(
                 format!("Footer length is {}, expected {}",
                     row.len(), hash_len)));
         }
@@ -202,11 +222,11 @@ impl Hashes {
     fn parse(row: &[u8], hash_type: HashType)
         -> Result<Hashes, ParseRowError>
     {
-        let digest_len = hash_type.get_size();
+        let digest_len = hash_type.output_bytes();
         let hash_len = digest_len * 2;
         let hashes_num = (row.len() + 1) / (hash_len + 1);
         if row.len() != 0 && (row.len() + 1) % (hash_len + 1) != 0 {
-            return Err(ParseRowError(
+            return Err(ParseRowError::Hashes(
                 format!("Hashes string length is {}, one hash should have exactly {} characters",
                     row.len(), hash_len)));
         }
@@ -214,8 +234,8 @@ impl Hashes {
         for hash in row.chunks(hash_len + 1) {
             parse_hash(&hash[..hash_len], hash_len, &mut data)?;
             if hash.len() == hash_len + 1 && hash[hash_len] != b' ' {
-                return Err(ParseRowError(
-                    format!("Invalid hashes delimiter: {:?}",
+                return Err(ParseRowError::Hashes(
+                    format!("Bad delimiter: {:?}",
                         String::from_utf8_lossy(&hash[hash_len..hash_len + 1]))));
             }
         }
@@ -231,7 +251,7 @@ impl Hashes {
     {
         let expected_hashes_num = ((file_size + block_size - 1) / block_size) as usize;
         if self.len() != expected_hashes_num {
-            return Err(ParseRowError(
+            return Err(ParseRowError::Hash(
                 format!("Expected {} hashes but found {}",
                     expected_hashes_num, self.len())));
         }
@@ -239,11 +259,11 @@ impl Hashes {
     }
 
     pub fn len(&self) -> usize {
-        self.data.len() / self.hash_type.get_size()
+        self.data.len() / self.hash_type.output_bytes()
     }
 
     pub fn iter<'a>(&'a self) -> Chunks<'a, u8> {
-        self.data.chunks(self.hash_type.get_size())
+        self.data.chunks(self.hash_type.output_bytes())
     }
 }
 
@@ -279,17 +299,13 @@ impl Entry {
                 let (dest, row) = parse_path_buf(row);
                 (Entry::Link(path, dest), row)
             } else {
-                return Err(ParseRowError(
-                    format!("Unknown file type: {:?}",
-                        String::from_utf8_lossy(file_type.as_bytes()))));
+                return Err(ParseRowError::FileType(file_type));
             }
         } else {
             return Ok(None);
         };
         if !tail.is_empty() {
-            return Err(ParseRowError(
-                format!("Row is not fully consumed: {:?}",
-                    String::from_utf8_lossy(tail))));
+            return Err(ParseRowError::EntryNotConsumed(tail));
         }
         Ok(Some(entry))
     }
@@ -421,13 +437,8 @@ fn parse_os_str<'a>(data: &'a [u8]) -> (&OsStr, &'a [u8]) {
 
 fn parse_u64<'a>(data: &'a [u8]) -> Result<(u64, &'a [u8]), ParseRowError> {
     let (field, tail) = parse_field(data);
-    let v = try!(std::str::from_utf8(field).map_err(|e| {
-        ParseRowError(format!("Cannot parse integer {:?}: {}",
-            String::from_utf8_lossy(field).into_owned(), e))}));
-
-    let v = try!(u64::from_str_radix(v, 10).map_err(|e| {
-        ParseRowError(format!("Cannot parse integer {:?}: {}",
-            String::from_utf8_lossy(field).into_owned(), e))}));
+    let s = std::str::from_utf8(field)?;
+    let v = u64::from_str_radix(s, 10)?;
     Ok((v, tail))
 }
 
@@ -439,11 +450,10 @@ fn parse_field<'a>(data: &'a [u8]) -> (&'a [u8], &'a [u8]) {
 }
 
 fn parse_hash<'a>(hash: &'a [u8], hash_len: usize, mut data: &mut Vec<u8>)
-                  -> Result<(), ParseRowError>
+    -> Result<(), ParseRowError>
 {
     if hash.len() != hash_len {
-        return Err(ParseRowError(
-            format!("Invalid hash: {:?}", hash)));
+        return Err(ParseRowError::Hash(hash.to_vec()));
     }
     for d in hash.chunks(2) {
         data.push(parse_hex(d)?);
