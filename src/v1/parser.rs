@@ -15,15 +15,6 @@ use ::HashType;
 use super::writer::{MAGIC, VERSION};
 
 
-macro_rules! itry {
-    ($x: expr) => {
-        match $x {
-            Err(e) => return Some(Err(From::from(e))),
-            Ok(v) => v,
-        }
-    }
-}
-
 quick_error! {
     /// The error type that represents errors which can happen when parsing
     /// specific row
@@ -361,44 +352,52 @@ impl<'a, R: BufRead> EntryIterator<'a, R> {
             current_row_num: 1,
         }
     }
+
+    fn parse_entry(&mut self) -> Result<Option<Entry>, ParseError> {
+        let mut buf = vec!();
+        let is_last = read_line(self.reader.by_ref(), &mut buf)?;
+        let row = &buf[..];
+        self.current_row_num += 1;
+        let entry = Entry::parse(
+                row, &self.current_dir, self.hash_type, self.block_size)
+            .context(self.current_row_num)?;
+        match entry {
+            None => {
+                let _footer = Footer::parse(row, self.hash_type)
+                    .context(self.current_row_num)?;
+                if is_last {
+                    return Err(ParseError::Parse(
+                        ParseRowError::InvalidEntry(
+                            format!("Footer must be ended by a newline")),
+                        self.current_row_num));
+                }
+                let mut test_buf = [0; 1];
+                if self.reader.read(&mut test_buf)? != 0 {
+                    return Err(ParseError::Parse(
+                        ParseRowError::InvalidEntry(
+                            format!("Found extra lines after the footer")),
+                        self.current_row_num));
+                }
+                Ok(None)
+            },
+            Some(entry) => {
+                if let Entry::Dir(ref dir_path) = entry {
+                    self.current_dir = dir_path.clone();
+                }
+                Ok(Some(entry))
+            },
+        }
+}
 }
 
 impl<'a, R: BufRead> Iterator for EntryIterator<'a, R> {
     type Item = Result<Entry, ParseError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let mut buf = vec!();
-        let is_last = itry!(read_line(self.reader.by_ref(), &mut buf));
-        let row = &buf[..];
-        self.current_row_num += 1;
-        let entry = itry!(Entry::parse(
-                row, &self.current_dir, self.hash_type, self.block_size)
-            .context(self.current_row_num));
-        match entry {
-            None => {
-                let _footer = itry!(Footer::parse(row, self.hash_type)
-                    .context(self.current_row_num));
-                if is_last {
-                    return Some(Err(ParseError::Parse(
-                        ParseRowError::InvalidEntry(
-                            format!("Footer must be ended by a newline")),
-                        self.current_row_num)));
-                }
-                let mut test_buf = [0; 1];
-                if itry!(self.reader.read(&mut test_buf)) != 0 {
-                    return Some(Err(ParseError::Parse(
-                        ParseRowError::InvalidEntry(
-                            format!("Found extra lines after the footer")),
-                        self.current_row_num)));
-                }
-                None
-            },
-            Some(entry) => {
-                if let Entry::Dir(ref dir_path) = entry {
-                    self.current_dir = dir_path.clone();
-                }
-                Some(Ok(entry))
-            },
+        match self.parse_entry() {
+            Ok(Some(entry)) => Some(Ok(entry)),
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
         }
     }
 }
