@@ -20,26 +20,38 @@ fn bench_parser_iterator_ubuntu(bencher: &mut Bencher) {
         process::exit(1);
     }
 
-    let mut num_iters = 0;
     let mut num_dirs = 0;
     let mut num_files = 0;
     let mut num_links = 0;
+    let idx_file = File::open(ubuntu_idx_path).unwrap();
+    let reader = BufReader::new(idx_file);
+    let mut signature_parser = Parser::new(reader).unwrap();
+    for entry in signature_parser.iter() {
+        match entry.unwrap() {
+            Entry::Dir(_) => num_dirs += 1,
+            Entry::File{..} => num_files += 1,
+            Entry::Link(..) => num_links += 1,
+        }
+    }
+
+    let mut num_iters = 0;
     bencher.iter(|| {
         let idx_file = File::open(ubuntu_idx_path).unwrap();
         let reader = BufReader::new(idx_file);
         let mut signature_parser = Parser::new(reader).unwrap();
         for entry in signature_parser.iter() {
             match entry.unwrap() {
-                Entry::Dir(_) => num_dirs += 1,
-                Entry::File(..) => num_files += 1,
-                Entry::Link(..) => num_links += 1,
+                Entry::Dir(_) => {},
+                Entry::File{..} => {},
+                Entry::Link(..) => {},
             }
         }
         num_iters += 1;
     });
     println!("");
     println!("{} iterations", num_iters);
-    println!("{} dirs processed", num_dirs);
-    println!("{} files processed", num_files);
-    println!("{} links processed", num_links);
+    println!("Signature file contains:");
+    println!("{} directories", num_dirs);
+    println!("{} files", num_files);
+    println!("{} links", num_links);
 }
