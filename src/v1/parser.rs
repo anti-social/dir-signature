@@ -403,16 +403,13 @@ impl<'a, R: BufRead> Iterator for EntryIterator<'a, R> {
 }
 
 fn read_line<R: BufRead>(reader: &mut R, mut buf: &mut Vec<u8>)
-    -> Result<bool, io::Error>
+    -> Result<(), io::Error>
 {
     let _ = reader.read_until(b'\n', &mut buf)?;
-    let is_last = if buf.ends_with(b"\n") {
-        buf.pop();
-        false
-    } else {
-        true
-    };
-    Ok(is_last)
+    if !buf.ends_with(b"\n") {
+        return Err();
+    }
+    Ok(())
 }
 
 fn parse_path<'a>(data: &'a [u8]) -> (Cow<Path>, &'a [u8]) {
