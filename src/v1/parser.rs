@@ -4,8 +4,7 @@ use std::cmp::Ordering;
 use std::convert::From;
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::io;
-use std::io::BufRead;
+use std::io::{self, BufRead, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::slice::Chunks;
 use std::str::FromStr;
@@ -370,6 +369,18 @@ impl<R: BufRead> Parser<R> {
     pub fn iter(&mut self) -> EntryIterator<R> {
         EntryIterator::new(&mut self.reader,
             self.header.hash_type, self.header.block_size)
+    }
+}
+
+impl<R: BufRead + Seek> Parser<R> {
+    /// Resets the parser to the beginning
+    pub fn reset(&mut self) -> Result<(), ParseError> {
+        self.reader.seek(SeekFrom::Start(0))?;
+
+        let mut header_line = vec!();
+        read_line(&mut self.reader, &mut header_line).context(1)?;
+        let _header = Header::parse(&header_line).context(1)?;
+        Ok(())
     }
 }
 
