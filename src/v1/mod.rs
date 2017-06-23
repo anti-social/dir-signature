@@ -11,9 +11,9 @@
 
 mod writer;
 mod progress;
-mod hash;
 mod scan;
 mod parser;
+pub mod hash;
 pub mod merge;
 
 use std::io;

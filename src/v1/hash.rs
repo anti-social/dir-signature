@@ -95,6 +95,12 @@ impl fmt::LowerHex for Sha512_256_Hex {
     }
 }
 
+impl Blake2b_256_Hex {
+    pub fn raw(&self) -> &[u8] {
+        &self.0[..32]
+    }
+}
+
 impl fmt::LowerHex for Blake2b_256_Hex {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let data = &self.0[..32];
